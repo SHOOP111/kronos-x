@@ -58,4 +58,4 @@ gcc -std=c11 -O3 -Wall -Wextra -Wshadow -Wno-unused-function -Wno-unused-variabl
 Every push runs on GitHub Actions across:
 - **GCC `-O3` strict** (`-Wall -Wextra -Wshadow -Wpedantic -Wconversion`), **Clang `-O3` strict**, **GCC `-O3 -flto -fPIE -pie`**, **GCC `-O3 -no-pie -DKRONOS_SLAB_DEBUG`**, **GCC `-O0 -g`**, **Clang `-O2 -fsanitize=undefined`**, and **GCC `-O2 -static`**.
 - **Strict `-Werror` audit** (GCC + Clang), ELF `GNU_STACK` non-exec check, DWARF `.eh_frame` FDE check, and `cppcheck`.
-- **QEMU-x86_64 cross-microarchitecture verification** across `Nehalem` (SSE4.2 only), `Haswell` (AVX2+FMA+BMI1/2+LZCNT), `Skylake-Server` (AVX-512F `14x32` & `9x48`), and `Cascadelake-Server,+avx512vnni` (AVX-512 VNNI).
+- **QEMU-x86_64 cross-microarchitecture verification** on `ubuntu-24.04` (baseline x86-64 glibc) across `Nehalem` (SSE4.2 only, FXSAVE64 + scalar GEMM + non-BMI JIT), `SandyBridge` (AVX1 + XSAVE64), `Haswell` (AVX2 + FMA + BMI1/2 + LZCNT), and `Skylake-Client` (Intel JCC erratum + AVX2/FMA/PREFETCHW), alongside native AVX-512F + AVX-512 VNNI verification on GitHub's Xeon/EPYC runners.

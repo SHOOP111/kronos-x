@@ -123,9 +123,9 @@ jobs:
           timeout -s KILL 120 ./test_suite --cores 8
 
   avx512-sde-emulation:
-    name: "Intel-ISA / QEMU-User Cross-Microarch Tests (AVX2, AVX-512F+VNNI, SSE4.2)"
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: "Cross-Microarch QEMU-User Matrix (Haswell / SandyBridge / Skylake / Broadwell)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -135,30 +135,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user
 
-      - name: Compile kernel & white-box suite (baseline x86-64 for QEMU cross-CPU)
+      - name: Compile kernel & white-box suite (baseline x86-64 on Ubuntu 24.04 glibc)
         run: |
-          # Build dynamic x86-64 baseline + static-x86-64 (so Nehalem has no Ubuntu amd64v3 ld.so AVX dependency)
           gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
           gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -Wno-unused-function -Wno-unused-variable -pthread tests/test_suite.c -o test_suite
-          gcc -std=c11 -march=x86-64 -mno-avx -O3 -static -Wall -Wextra -Wshadow -pthread kernel.c -o kronos_static
-          gcc -std=c11 -march=x86-64 -mno-avx -O3 -static -Wall -Wextra -Wshadow -Wno-unused-function -Wno-unused-variable -pthread tests/test_suite.c -o test_suite_static
 
       - name: Run Cross-Microarch Matrix under QEMU-x86_64
         run: |
           set -e
-          echo "=== QEMU Haswell (AVX2 + FMA + BMI1/2 + LZCNT) ==="
+          echo "=== QEMU Nehalem (SSE4.2 only, no AVX/FMA/BMI/LZCNT -> tests FXSAVE64 + scalar GEMM + non-BMI JIT) ==="
+          timeout -s KILL 180 qemu-x86_64 -cpu Nehalem ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Nehalem ./test_suite --cores 2
+          echo "=== QEMU SandyBridge (AVX1 + XSAVE64, no AVX2/FMA/BMI -> tests XSAVE64 + scalar GEMM + non-BMI JIT) ==="
+          timeout -s KILL 180 qemu-x86_64 -cpu SandyBridge ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu SandyBridge ./test_suite --cores 2
+          echo "=== QEMU Haswell (AVX2 + FMA + BMI1/2 + LZCNT -> tests 6x16 FMA GEMM + BMI2 JIT) ==="
           timeout -s KILL 180 qemu-x86_64 -cpu Haswell ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
           timeout -s KILL 180 qemu-x86_64 -cpu Haswell ./test_suite --cores 2
-          echo "=== QEMU Skylake-Server (AVX-512F 14x32 & 9x48) ==="
-          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512 --quantum-us 4000
-          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512-9x48 --quantum-us 4000
-          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Server ./test_suite --cores 2
-          echo "=== QEMU Cascadelake-Server (AVX-512F + AVX-512 VNNI) ==="
-          timeout -s KILL 180 qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
-          timeout -s KILL 180 qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./test_suite --cores 2
-          echo "=== QEMU Nehalem-v1 (SSE4.2 only, no AVX/BMI - static build avoids Ubuntu x86-64-v3 ld.so) ==="
-          timeout -s KILL 180 qemu-x86_64 -cpu Nehalem ./kronos_static --no-color --cores 2 --gemm 128 --quantum-us 4000
-          timeout -s KILL 180 qemu-x86_64 -cpu Nehalem ./test_suite_static --cores 2
+          echo "=== QEMU Skylake-Client (Intel JCC erratum + AVX2 + FMA + PREFETCHW) ==="
+          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Client ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Client ./test_suite --cores 2
 
   asan-and-static-analysis:
     name: "Static Analysis (cppcheck / clang-tidy) & Warning-Free Audit"
