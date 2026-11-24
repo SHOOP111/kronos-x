@@ -10377,18 +10377,29 @@ static void run_stage4_gemm(int dim, const char *req_kernel) {
         float *ba = (float *)xaligned_alloc(64, (size_t)bdim * (size_t)bdim * sizeof(float));
         float *bb = (float *)xaligned_alloc(64, (size_t)bdim * (size_t)bdim * sizeof(float));
         float *bc = (float *)xaligned_alloc(64, (size_t)bdim * (size_t)bdim * sizeof(float));
-        memset(ba, 0, (size_t)bdim * (size_t)bdim * sizeof(float));
-        memset(bb, 0, (size_t)bdim * (size_t)bdim * sizeof(float));
+        /* Non-zero finite floats avoid zero-operand FP short-circuit skew during bake-off */
+        for (size_t i = 0; i < (size_t)bdim * (size_t)bdim; i++) {
+            ba[i] = (float)((int)(i & 63u) - 32) * 0.01f;
+            bb[i] = (float)((int)((i * 7u) & 63u) - 32) * 0.01f;
+        }
         GemmTuning t14 = kronos_autotune_gemm(&g_gemm_avx512);
         GemmTuning t9  = kronos_autotune_gemm(&g_gemm_avx512_9x48);
         kronos_sgemm_ex(bdim, bdim, bdim, 1.0f, ba, bb, 0.0f, bc, t14, &g_gemm_avx512, &ws);
-        uint64_t a0 = monotonic_ns();
-        kronos_sgemm_ex(bdim, bdim, bdim, 1.0f, ba, bb, 0.0f, bc, t14, &g_gemm_avx512, &ws);
-        uint64_t dt14 = safe_delta_ns(monotonic_ns(), a0);
+        uint64_t dt14 = UINT64_MAX;
+        for (int r = 0; r < 3; r++) {
+            uint64_t a0 = monotonic_ns();
+            kronos_sgemm_ex(bdim, bdim, bdim, 1.0f, ba, bb, 0.0f, bc, t14, &g_gemm_avx512, &ws);
+            uint64_t d = safe_delta_ns(monotonic_ns(), a0);
+            if (d < dt14) dt14 = d;
+        }
         kronos_sgemm_ex(bdim, bdim, bdim, 1.0f, ba, bb, 0.0f, bc, t9, &g_gemm_avx512_9x48, &ws);
-        uint64_t b0 = monotonic_ns();
-        kronos_sgemm_ex(bdim, bdim, bdim, 1.0f, ba, bb, 0.0f, bc, t9, &g_gemm_avx512_9x48, &ws);
-        uint64_t dt9 = safe_delta_ns(monotonic_ns(), b0);
+        uint64_t dt9 = UINT64_MAX;
+        for (int r = 0; r < 3; r++) {
+            uint64_t b0 = monotonic_ns();
+            kronos_sgemm_ex(bdim, bdim, bdim, 1.0f, ba, bb, 0.0f, bc, t9, &g_gemm_avx512_9x48, &ws);
+            uint64_t d = safe_delta_ns(monotonic_ns(), b0);
+            if (d < dt9) dt9 = d;
+        }
         if (dt9 < dt14) kd = &g_gemm_avx512_9x48;
         free(ba); free(bb); free(bc);
     }
@@ -10650,12 +10661,24 @@ static void run_stage5_telemetry_hud(void) {
             tot_ipi, tot_def, tw, g_tel.timer_jitter_avg_us, g_tel.timer_jitter_max_us);
 }
 
+static void emit_json_escaped(const char *s) {
+    putchar('"');
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            if (*p == '"' || *p == '\\') { putchar('\\'); putchar((int)*p); }
+            else if (*p >= 0x20u)        { putchar((int)*p); }
+        }
+    }
+    putchar('"');
+}
+
 static void emit_structured_telemetry(int fails) {
     if (g_out_mode == OUT_JSON) {
-        printf("{\n"
-               "  \"version\": \"5.0\",\n"
-               "  \"cpu_brand\": \"%s\",\n"
-               "  \"vendor\": \"%s\",\n"
+        printf("{\n  \"version\": \"5.0\",\n  \"cpu_brand\": ");
+        emit_json_escaped(g_cpu.brand);
+        printf(",\n  \"vendor\": ");
+        emit_json_escaped(g_cpu.vendor);
+        printf(",\n"
                "  \"cores\": %d,\n"
                "  \"numa_nodes\": %d,\n"
                "  \"l3_domains\": %d,\n"
@@ -10694,7 +10717,7 @@ static void emit_structured_telemetry(int fails) {
                "  \"timer_jitter_max_us\": %.2f,\n"
                "  \"failures\": %d\n"
                "}\n",
-               g_cpu.brand, g_cpu.vendor, g_kern.num_cores, g_cpu.num_numa_nodes,
+               g_kern.num_cores, g_cpu.num_numa_nodes,
                g_cpu.num_l3_domains, g_cpu.tsc_ghz,
                g_tel.slab_cy_pair, g_tel.slab_mops, g_tel.slab_hit_pct, g_tel.slab_unique_colors,
                g_tel.ctx_runnext_cy, g_tel.ctx_mux_ns, g_tel.mpmc_mmsgs,

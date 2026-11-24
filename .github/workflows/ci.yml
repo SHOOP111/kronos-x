@@ -137,25 +137,28 @@ jobs:
 
       - name: Compile kernel & white-box suite (baseline x86-64 for QEMU cross-CPU)
         run: |
+          # Build dynamic x86-64 baseline + static-x86-64 (so Nehalem has no Ubuntu amd64v3 ld.so AVX dependency)
           gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
-          gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -pthread tests/test_suite.c -o test_suite
+          gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -Wno-unused-function -Wno-unused-variable -pthread tests/test_suite.c -o test_suite
+          gcc -std=c11 -march=x86-64 -mno-avx -O3 -static -Wall -Wextra -Wshadow -pthread kernel.c -o kronos_static
+          gcc -std=c11 -march=x86-64 -mno-avx -O3 -static -Wall -Wextra -Wshadow -Wno-unused-function -Wno-unused-variable -pthread tests/test_suite.c -o test_suite_static
 
-      - name: Inspect Nehalem QEMU behavior & Run Cross-Microarch Matrix
+      - name: Run Cross-Microarch Matrix under QEMU-x86_64
         run: |
           set -e
-          echo "=== QEMU Nehalem (SSE4.2, no AVX/BMI) ==="
-          qemu-x86_64 -d in_asm,cpu_reset -D /tmp/nehalem.log -cpu Nehalem ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000 || { tail -n 80 /tmp/nehalem.log; exit 1; }
-          qemu-x86_64 -cpu Nehalem ./test_suite --cores 2
           echo "=== QEMU Haswell (AVX2 + FMA + BMI1/2 + LZCNT) ==="
-          qemu-x86_64 -cpu Haswell ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
-          qemu-x86_64 -cpu Haswell ./test_suite --cores 2
+          timeout -s KILL 180 qemu-x86_64 -cpu Haswell ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Haswell ./test_suite --cores 2
           echo "=== QEMU Skylake-Server (AVX-512F 14x32 & 9x48) ==="
-          qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512 --quantum-us 2000
-          qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512-9x48 --quantum-us 2000
-          qemu-x86_64 -cpu Skylake-Server ./test_suite --cores 2
+          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512-9x48 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Skylake-Server ./test_suite --cores 2
           echo "=== QEMU Cascadelake-Server (AVX-512F + AVX-512 VNNI) ==="
-          qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
-          qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./test_suite --cores 2
+          timeout -s KILL 180 qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./kronos --no-color --cores 2 --gemm 128 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./test_suite --cores 2
+          echo "=== QEMU Nehalem-v1 (SSE4.2 only, no AVX/BMI - static build avoids Ubuntu x86-64-v3 ld.so) ==="
+          timeout -s KILL 180 qemu-x86_64 -cpu Nehalem ./kronos_static --no-color --cores 2 --gemm 128 --quantum-us 4000
+          timeout -s KILL 180 qemu-x86_64 -cpu Nehalem ./test_suite_static --cores 2
 
   asan-and-static-analysis:
     name: "Static Analysis (cppcheck / clang-tidy) & Warning-Free Audit"

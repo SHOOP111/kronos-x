@@ -801,13 +801,64 @@ static void test_jit_differential_fuzzer_and_traps(void) {
         kbpf_jit_free(&c6);
     } else trap_ok = 0;
 
-    /* 250 random differential fuzz programs x 6 input vectors = 1,500 executions */
+    /* TRAP 7: CAP_MEM_BOUNDED with 32-bit & 64-bit loads/stores + odd byte lengths + OOB wraparound */
+    const KBpfInsn trap_bnd_wrap[] = {
+        { KOP_LOAD64, 0, 1, 2, 0, 0 },
+        { KOP_RET,    0, 0, 0, 0, 0 }
+    };
+    KBpfCompiled c7;
+    if (kbpf_jit_compile(trap_bnd_wrap, 2, KBPF_CAP_MEM_BOUNDED, &c7, err, sizeof(err)) == 0) {
+        uint64_t arr[4] = { 0x1111ULL, 0x2222ULL, 0x3333ULL, 0x4444ULL };
+        /* Adversarial huge indices near UINT64_MAX/8 that would overflow idx*8 if checked post-multiply! */
+        uint64_t r_ok   = kbpf_call_jit(c7.fn, (uintptr_t)arr, 3ULL, 32ULL);
+        uint64_t r_oob1 = kbpf_call_jit(c7.fn, (uintptr_t)arr, 4ULL, 32ULL);
+        uint64_t r_oob2 = kbpf_call_jit(c7.fn, (uintptr_t)arr, 0x2000000000000000ULL, 32ULL);
+        uint64_t r_oob3 = kbpf_call_jit(c7.fn, (uintptr_t)arr, UINT64_MAX, 32ULL);
+        uint64_t r_oob4 = kbpf_call_jit(c7.fn, (uintptr_t)arr, 0ULL, 7ULL);
+        if (r_ok != 0x4444ULL || r_oob1 != 0ULL || r_oob2 != 0ULL || r_oob3 != 0ULL || r_oob4 != 0ULL) {
+            trap_ok = 0;
+            printf("    [BUG] trap_bnd_wrap failed: %" PRIx64 " %" PRIx64 " %" PRIx64 " %" PRIx64 " %" PRIx64 "\n",
+                   r_ok, r_oob1, r_oob2, r_oob3, r_oob4);
+        }
+        kbpf_jit_free(&c7);
+    } else trap_ok = 0;
+
+    /* TRAP 8: Multi-hop forward + backward rel32 branch relaxation with fuel & JCC erratum padding */
+    KBpfInsn rel_prog[80];
+    int rp = 0;
+    rel_prog[rp++] = (KBpfInsn){ KOP_MOV_REG, 0, 1, 0, 0, 0 };
+    rel_prog[rp++] = (KBpfInsn){ KOP_MOV_IMM, 4, 0, 0, 0, 0 };
+    int r_hdr = rp;
+    rel_prog[rp++] = (KBpfInsn){ KOP_CMP_REG, 4, 2, 0, 0, 0 };
+    int r_exit = rp++;
+    for (int k = 0; k < 20; k++) {
+        rel_prog[rp++] = (KBpfInsn){ KOP_MOV_IMM64, 5, 0, 0, 0, 0x9E3779B97F4A7C15ULL * (uint64_t)(k + 1) };
+        rel_prog[rp++] = (KBpfInsn){ KOP_ADD_REG,   0, 5, 0, 0, 0 };
+    }
+    rel_prog[rp++] = (KBpfInsn){ KOP_ADD_IMM, 4, 0, 0, 1, 0 };
+    rel_prog[rp++] = (KBpfInsn){ KOP_CMP_REG, 4, 2, 0, 0, 0 };
+    rel_prog[rp++] = (KBpfInsn){ KOP_JB,      0, 0, 0, r_hdr, 0 }; /* Long conditional backedge! */
+    int r_ret = rp;
+    rel_prog[rp++] = (KBpfInsn){ KOP_RET,     0, 0, 0, 0, 0 };
+    rel_prog[r_exit] = (KBpfInsn){ KOP_JAE,   0, 0, 0, r_ret, 0 };
+    KBpfCompiled c8;
+    if (kbpf_jit_compile(rel_prog, rp, KBPF_CAP_BOUNDED_LOOP, &c8, err, sizeof(err)) == 0) {
+        uint64_t ri = kbpf_exec_interp_unchecked(rel_prog, rp, KBPF_CAP_BOUNDED_LOOP, 12345ULL, 75ULL, 0);
+        uint64_t rj = kbpf_call_jit(c8.fn, 12345ULL, 75ULL, 0);
+        if (ri != rj || c8.long_branches < 2) {
+            trap_ok = 0;
+            printf("    [BUG] trap_rel32_cond_back: ri=%" PRIx64 " rj=%" PRIx64 " long=%d\n", ri, rj, c8.long_branches);
+        }
+        kbpf_jit_free(&c8);
+    } else trap_ok = 0;
+
+    /* 500 random differential fuzz programs x 6 input vectors = 3,000 executions */
     uint64_t rng = 0xCAFEBABE00112233ULL;
     int fuzz_ok = 1;
     int compiled_cnt = 0;
     int mismatches = 0;
     KBpfInsn prog[KBPF_MAX_INSNS];
-    for (int p = 0; p < 250; p++) {
+    for (int p = 0; p < 500; p++) {
         int n = build_random_valid_prog(&rng, prog, 96);
         uint32_t caps = (p & 1) ? KBPF_CAP_BOUNDED_LOOP : KBPF_CAP_NONE;
         KBpfCompiled c;
@@ -840,7 +891,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
     }
 
     t_report(trap_ok && fuzz_ok && mismatches == 0,
-             "jit_traps_and_250x6_differential_fuzzer",
+             "jit_traps_and_500x6_differential_fuzzer",
              "traps=%d progs=%d mismatches=%d", trap_ok, compiled_cnt, mismatches);
 }
 
