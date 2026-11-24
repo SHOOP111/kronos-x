@@ -114,13 +114,13 @@ jobs:
         if: matrix.run_suite
         run: |
           set -e
-          ${{ matrix.cc }} ${{ matrix.cflags }} tests/test_suite.c -o test_suite
+          ${{ matrix.cc }} ${{ matrix.cflags }} -Wno-unused-function -Wno-unused-variable tests/test_suite.c -o test_suite
           echo "=== Test Suite (native cores) ==="
-          ./test_suite
+          timeout -s KILL 120 ./test_suite
           echo "=== Test Suite (1 core) ==="
-          ./test_suite --cores 1
+          timeout -s KILL 120 ./test_suite --cores 1
           echo "=== Test Suite (oversubscribed 8 vCores) ==="
-          ./test_suite --cores 8
+          timeout -s KILL 120 ./test_suite --cores 8
 
   avx512-sde-emulation:
     name: "Intel-ISA / QEMU-User Cross-Microarch Tests (AVX2, AVX-512F+VNNI, SSE4.2)"
@@ -135,29 +135,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user
 
-      - name: Compile kernel & white-box suite (baseline x86-64 for Nehalem emulation)
+      - name: Compile kernel & white-box suite (baseline x86-64 for QEMU cross-CPU)
         run: |
-          gcc -std=c11 -march=x86-64 -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
-          gcc -std=c11 -march=x86-64 -O3 -Wall -Wextra -Wshadow -pthread tests/test_suite.c -o test_suite
+          gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
+          gcc -std=c11 -march=x86-64 -mno-avx -O3 -Wall -Wextra -Wshadow -pthread tests/test_suite.c -o test_suite
 
-      - name: Run under QEMU-x86_64 (Nehalem - SSE4.2 only, no AVX/BMI)
+      - name: Inspect Nehalem QEMU behavior & Run Cross-Microarch Matrix
         run: |
-          qemu-x86_64 -cpu Nehalem ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
+          set -e
+          echo "=== QEMU Nehalem (SSE4.2, no AVX/BMI) ==="
+          qemu-x86_64 -d in_asm,cpu_reset -D /tmp/nehalem.log -cpu Nehalem ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000 || { tail -n 80 /tmp/nehalem.log; exit 1; }
           qemu-x86_64 -cpu Nehalem ./test_suite --cores 2
-
-      - name: Run under QEMU-x86_64 (Haswell - AVX2 + FMA + BMI1/2 + LZCNT)
-        run: |
+          echo "=== QEMU Haswell (AVX2 + FMA + BMI1/2 + LZCNT) ==="
           qemu-x86_64 -cpu Haswell ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
           qemu-x86_64 -cpu Haswell ./test_suite --cores 2
-
-      - name: Run under QEMU-x86_64 (Skylake-Server - AVX-512F + 14x32 & 9x48)
-        run: |
+          echo "=== QEMU Skylake-Server (AVX-512F 14x32 & 9x48) ==="
           qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512 --quantum-us 2000
           qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512-9x48 --quantum-us 2000
           qemu-x86_64 -cpu Skylake-Server ./test_suite --cores 2
-
-      - name: Run under QEMU-x86_64 (Cascadelake-Server - AVX-512F + AVX-512 VNNI)
-        run: |
+          echo "=== QEMU Cascadelake-Server (AVX-512F + AVX-512 VNNI) ==="
           qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
           qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./test_suite --cores 2
 

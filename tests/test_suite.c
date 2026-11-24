@@ -342,23 +342,26 @@ static void bar_stress_fiber(void *arg) {
 }
 
 static void test_dissem_barrier_wrap(void) {
+    /* Test UINT32_MAX wrap-around on BOTH 1-core, 4-core, and oversubscribed 8-core setups! */
     int P = g_kern.num_cores;
-    KronosDissemBarrier *bar = (KronosDissemBarrier *)xaligned_alloc(64, sizeof(KronosDissemBarrier));
-    dissem_init(bar, P);
-    _Atomic uint64_t shared = 0;
-    KronosLatch l;
-    latch_init(&l, (uint32_t)P);
-    BarStressArg args[KRONOS_MAX_CORES];
-    for (int i = 0; i < P; i++) {
-        args[i] = (BarStressArg){ bar, i, P, 2000, &shared, 0, &l };
-    }
-    kronos_spawn_batch_pinned(bar_stress_fiber, args, sizeof(BarStressArg), P, 0);
-    latch_wait(&l);
     int errs = 0;
-    for (int i = 0; i < P; i++) errs += args[i].errs;
-    free(bar);
+    for (int trial = 0; trial < 20; trial++) {
+        KronosDissemBarrier *bar = (KronosDissemBarrier *)xaligned_alloc(64, sizeof(KronosDissemBarrier));
+        dissem_init(bar, P);
+        _Atomic uint64_t shared = 0;
+        KronosLatch l;
+        latch_init(&l, (uint32_t)P);
+        BarStressArg args[KRONOS_MAX_CORES];
+        for (int i = 0; i < P; i++) {
+            args[i] = (BarStressArg){ bar, i, P, 250, &shared, 0, &l };
+        }
+        kronos_spawn_batch_pinned(bar_stress_fiber, args, sizeof(BarStressArg), P, 0);
+        latch_wait(&l);
+        for (int i = 0; i < P; i++) errs += args[i].errs;
+        free(bar);
+    }
     t_report(errs == 0, "dissem_barrier_u32_wrap_and_visibility",
-             "cores=%d iters=2000 errs=%d", P, errs);
+             "cores=%d trials=20x250 errs=%d", P, errs);
 }
 
 /* ============================================================================

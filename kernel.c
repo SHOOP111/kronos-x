@@ -944,7 +944,7 @@ static int pmu_open_hw_tid_ex(uint64_t base_config, pid_t tid, int is_ecore,
     memset(&pe, 0, sizeof(pe));
     pe.type           = PERF_TYPE_HARDWARE;
     pe.size           = sizeof(pe);
-    pe.disabled       = (group_fd < 0) ? 1u : 0u;
+    pe.disabled       = (unsigned)(group_fd < 0);
     pe.exclude_kernel = 1;
     pe.exclude_hv     = 1;
     pe.read_format    = read_fmt;
@@ -5185,8 +5185,13 @@ static void dissem_init(KronosDissemBarrier *b, int max_participants) {
 static inline void dissem_wait_group(KronosDissemBarrier *b, int group_base,
                                      int local_id, int group_size, uint32_t *epoch_io) {
     if (group_size <= 1) return;
-    uint32_t ep = ++(*epoch_io);
-    if (UNLIKELY(ep == 0u)) ep = ++(*epoch_io);
+    /* Advance epoch monotonically; skip 0 AND preserve bank parity across UINT32_MAX wrap!
+     * bank = (ep & 1) alternates 0/1 every wait; skipping 0 from 0xFFFFFFFF -> 2 preserves
+     * parity (0xFFFFFFFF is odd -> bank 1, 2 is even -> bank 0) so fast peers cannot alias
+     * bank 1 of epoch 0xFFFFFFFF with bank 1 of epoch 1! */
+    uint32_t ep = (*epoch_io) + 1u;
+    if (UNLIKELY(ep == 0u)) ep = 2u;
+    *epoch_io = ep;
     uint32_t bank = ep & 1u;
     int self_idx  = group_base + local_id;
 
