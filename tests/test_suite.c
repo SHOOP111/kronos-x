@@ -61,8 +61,10 @@ static void slab_torture_fiber(void *arg) {
     for (int r = 0; r < a->rounds; r++) {
         int slot = (int)(xorshift64(&rng) % LIVE);
         if (ptrs[slot]) {
+            int pcls = slab_class_for(szs[slot]);
+            size_t peff = (pcls >= 0) ? k_slab_sizes[pcls] : szs[slot];
+            size_t nq = (peff >= 8u) ? (peff / sizeof(uint64_t)) : 1u;
             uint64_t *q = (uint64_t *)ptrs[slot];
-            size_t nq = szs[slot] / sizeof(uint64_t);
             if (q[0] != pat[slot] || q[nq - 1] != (pat[slot] ^ 0xA5A5A5A5A5A5A5A5ULL)) {
                 errs++;
             }
@@ -514,7 +516,10 @@ static void deferred_preempt_stress_fiber(void *arg) {
         kronos_preempt_disable();
         kronos_preempt_disable();
         uint64_t x = acc;
-        for (int k = 0; k < 4000; k++) x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        for (int k = 0; k < 20000; k++) {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            __asm__ volatile("" : "+r"(x));
+        }
         acc = x;
         if ((kronos_preempt_read_word() & KRONOS_PREEMPT_MASK) != 3u) errs++;
         kronos_preempt_enable();
@@ -670,7 +675,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
         uint64_t cases[4][2] = { {0, 12345}, {0, 7}, {42, 12345}, {42, 7} };
         for (int i = 0; i < 4; i++) {
             uint64_t ri = kbpf_exec_interp_unchecked(trap_and_neg1, 7, KBPF_CAP_NONE, cases[i][0], cases[i][1], 0);
-            uint64_t rj = c1.fn(cases[i][0], cases[i][1], 0);
+            uint64_t rj = kbpf_call_jit(c1.fn, cases[i][0], cases[i][1], 0);
             if (ri != rj) { trap_ok = 0; printf("    [BUG] trap_and_neg1 case %d: interp=%" PRIu64 " jit=%" PRIu64 "\n", i, ri, rj); }
         }
         kbpf_jit_free(&c1);
@@ -698,7 +703,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 uint64_t ri = kbpf_exec_interp_unchecked(trap_and_signed, 6, KBPF_CAP_NONE, tvals[i], tvals[j], 0);
-                uint64_t rj = c2.fn(tvals[i], tvals[j], 0);
+                uint64_t rj = kbpf_call_jit(c2.fn, tvals[i], tvals[j], 0);
                 if (ri != rj) { trap_ok = 0; printf("    [BUG] trap_and_signed (%d,%d): interp=%" PRIu64 " jit=%" PRIu64 "\n", i, j, ri, rj); }
             }
         }
@@ -722,7 +727,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
         uint64_t vals[4] = { 0, 1, 0x100, UINT64_MAX };
         for (int i = 0; i < 4; i++) {
             uint64_t ri = kbpf_exec_interp_unchecked(trap_and_all_cc, 9, KBPF_CAP_NONE, vals[i], 0x111, 0x222);
-            uint64_t rj = c3.fn(vals[i], 0x111, 0x222);
+            uint64_t rj = kbpf_call_jit(c3.fn, vals[i], 0x111, 0x222);
             if (ri != rj) { trap_ok = 0; printf("    [BUG] trap_and_all_cc %d: interp=%" PRIu64 " jit=%" PRIu64 "\n", i, ri, rj); }
         }
         kbpf_jit_free(&c3);
@@ -739,9 +744,9 @@ static void test_jit_differential_fuzzer_and_traps(void) {
     KBpfCompiled c4;
     if (kbpf_jit_compile(trap_cond_back, 5, KBPF_CAP_BOUNDED_LOOP, &c4, err, sizeof(err)) == 0) {
         uint64_t r0i = kbpf_exec_interp_unchecked(trap_cond_back, 5, KBPF_CAP_BOUNDED_LOOP, 0, 777, 0);
-        uint64_t r0j = c4.fn(0, 777, 0);
+        uint64_t r0j = kbpf_call_jit(c4.fn, 0, 777, 0);
         uint64_t r1i = kbpf_exec_interp_unchecked(trap_cond_back, 5, KBPF_CAP_BOUNDED_LOOP, 1, 777, 0);
-        uint64_t r1j = c4.fn(1, 777, 0);
+        uint64_t r1j = kbpf_call_jit(c4.fn, 1, 777, 0);
         if (r0i != r0j || r1i != r1j || r0j != 777 || r1j != KBPF_FUEL_EXHAUSTED) {
             trap_ok = 0;
             printf("    [BUG] trap_cond_back: r0=(%" PRIu64 ",%" PRIu64 ") r1=(%" PRIx64 ",%" PRIx64 ")\n", r0i, r0j, r1i, r1j);
@@ -765,7 +770,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
     KBpfCompiled c5;
     if (kbpf_jit_compile(trap_fuel_udiv, 10, KBPF_CAP_BOUNDED_LOOP, &c5, err, sizeof(err)) == 0) {
         uint64_t ri = kbpf_exec_interp_unchecked(trap_fuel_udiv, 10, KBPF_CAP_BOUNDED_LOOP, 100, 3, 42);
-        uint64_t rj = c5.fn(100, 3, 42);
+        uint64_t rj = kbpf_call_jit(c5.fn, 100, 3, 42);
         if (ri != rj) {
             trap_ok = 0;
             printf("    [BUG] trap_fuel_udiv: interp=%" PRIu64 " jit=%" PRIu64 "\n", ri, rj);
@@ -787,7 +792,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
         for (int i = 0; i < 4; i++) {
             uint64_t a0 = (i == 0) ? 0ULL : ((i == 1) ? 0x100ULL : 0x105ULL);
             uint64_t ri = kbpf_exec_interp_unchecked(trap_dce_and, 6, KBPF_CAP_NONE, a0, 99, 0);
-            uint64_t rj = c6.fn(a0, 99, 0);
+            uint64_t rj = kbpf_call_jit(c6.fn, a0, 99, 0);
             if (ri != rj) { trap_ok = 0; printf("    [BUG] trap_dce_and %d: interp=%" PRIu64 " jit=%" PRIu64 "\n", i, ri, rj); }
         }
         kbpf_jit_free(&c6);
@@ -819,7 +824,7 @@ static void test_jit_differential_fuzzer_and_traps(void) {
         };
         for (int k = 0; k < 6; k++) {
             uint64_t ri = kbpf_exec_interp_unchecked(prog, n, caps, inputs[k][0], inputs[k][1], inputs[k][2]);
-            uint64_t rj = c.fn(inputs[k][0], inputs[k][1], inputs[k][2]);
+            uint64_t rj = kbpf_call_jit(c.fn, inputs[k][0], inputs[k][1], inputs[k][2]);
             if (ri != rj) {
                 mismatches++;
                 fuzz_ok = 0;

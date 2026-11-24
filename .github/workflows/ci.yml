@@ -18,13 +18,13 @@ jobs:
         include:
           - name: "GCC-O3-Strict"
             cc: gcc
-            cflags: "-std=c11 -O3 -Wall -Wextra -Wshadow -Wpedantic -Wconversion -Wno-sign-conversion -Werror=implicit-function-declaration -Werror=return-type -pthread"
+            cflags: "-std=c11 -O3 -Wall -Wextra -Wshadow -Wpedantic -Wno-overlength-strings -Wconversion -Wno-sign-conversion -Werror=implicit-function-declaration -Werror=return-type -pthread"
             run_bench: true
             run_suite: true
             run_cli: true
           - name: "Clang-O3-Strict"
             cc: clang
-            cflags: "-std=c11 -O3 -Wall -Wextra -Wshadow -Wpedantic -Werror=implicit-function-declaration -Werror=return-type -pthread"
+            cflags: "-std=c11 -O3 -Wall -Wextra -Wshadow -Wpedantic -Wno-overlength-strings -Werror=implicit-function-declaration -Werror=return-type -pthread"
             run_bench: true
             run_suite: true
             run_cli: false
@@ -135,10 +135,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user
 
-      - name: Compile kernel & white-box suite
+      - name: Compile kernel & white-box suite (baseline x86-64 for Nehalem emulation)
         run: |
-          gcc -std=c11 -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
-          gcc -std=c11 -O3 -Wall -Wextra -Wshadow -pthread tests/test_suite.c -o test_suite
+          gcc -std=c11 -march=x86-64 -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
+          gcc -std=c11 -march=x86-64 -O3 -Wall -Wextra -Wshadow -pthread tests/test_suite.c -o test_suite
 
       - name: Run under QEMU-x86_64 (Nehalem - SSE4.2 only, no AVX/BMI)
         run: |

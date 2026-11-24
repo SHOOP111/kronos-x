@@ -944,7 +944,7 @@ static int pmu_open_hw_tid_ex(uint64_t base_config, pid_t tid, int is_ecore,
     memset(&pe, 0, sizeof(pe));
     pe.type           = PERF_TYPE_HARDWARE;
     pe.size           = sizeof(pe);
-    pe.disabled       = (group_fd < 0) ? 1 : 0;
+    pe.disabled       = (group_fd < 0) ? 1u : 0u;
     pe.exclude_kernel = 1;
     pe.exclude_hv     = 1;
     pe.read_format    = read_fmt;
@@ -6620,15 +6620,18 @@ static void kbpf_emit_pass(const KBpfInsn *prog, int n, uint32_t caps,
         case KOP_AND_REG:
             emit8(jb, jit_rex(1, hs, 0, hd)); emit8(jb, 0x21); emit8(jb, jit_modrm(3, hs, hd));
             /* Fuse AND_REG hd, hs + CMP_IMM hd, 0 (AND already sets exact ZF/SF/OF=0/CF=0!) */
-            if (pc + 1 < n && an->reachable[pc + 1] && !an->is_jump_target[pc + 1] &&
+            if (pc + 1 < n && an->reachable[pc + 1] && !an->dead[pc + 1] && !an->is_jump_target[pc + 1] &&
                 prog[pc + 1].op == KOP_CMP_IMM && prog[pc + 1].dst == in->dst &&
                 prog[pc + 1].imm32 == 0) {
                 pc_off[pc + 1] = jb->len; pc++; peephole++;
             }
             break;
-        case KOP_AND_IMM:
-            if (in->imm32 == -1) { peephole++; break; }
-            if (in->imm32 == 0) {
+        case KOP_AND_IMM: {
+            int emitted_flags = 1;
+            if (in->imm32 == -1) {
+                peephole++;
+                emitted_flags = 0; /* No instruction emitted -> flags NOT set for dst! */
+            } else if (in->imm32 == 0) {
                 emit_xor_zero32(jb, hd); peephole++;
             } else if (in->imm32 > 0) {
                 if (hd >= 8) emit8(jb, jit_rex(0, 0, 0, hd));
@@ -6643,12 +6646,13 @@ static void kbpf_emit_pass(const KBpfInsn *prog, int n, uint32_t caps,
             } else {
                 emit_alu_imm64(jb, 4, hd, in->imm32);
             }
-            if (pc + 1 < n && an->reachable[pc + 1] && !an->is_jump_target[pc + 1] &&
-                prog[pc + 1].op == KOP_CMP_IMM && prog[pc + 1].dst == in->dst &&
-                prog[pc + 1].imm32 == 0) {
+            if (emitted_flags && pc + 1 < n && an->reachable[pc + 1] && !an->dead[pc + 1] &&
+                !an->is_jump_target[pc + 1] && prog[pc + 1].op == KOP_CMP_IMM &&
+                prog[pc + 1].dst == in->dst && prog[pc + 1].imm32 == 0) {
                 pc_off[pc + 1] = jb->len; pc++; peephole++;
             }
             break;
+        }
         case KOP_OR_REG:
             emit8(jb, jit_rex(1, hs, 0, hd)); emit8(jb, 0x09); emit8(jb, jit_modrm(3, hs, hd));
             break;
@@ -7001,6 +7005,17 @@ static int kbpf_jit_compile(const KBpfInsn *prog, int n, uint32_t caps,
     return 0;
 }
 
+#if defined(__clang__)
+#define KRONOS_NO_UBSAN_FUNC __attribute__((no_sanitize("function")))
+#else
+#define KRONOS_NO_UBSAN_FUNC
+#endif
+
+static inline KRONOS_NO_UBSAN_FUNC uint64_t kbpf_call_jit(KBpfJitFn fn,
+                                                          uint64_t a0, uint64_t a1, uint64_t a2) {
+    return fn(a0, a1, a2);
+}
+
 static void kbpf_jit_free(KBpfCompiled *c) {
     if (c && c->code) {
         kronos_unregister_code_range(c->code_range_slot);
@@ -7175,6 +7190,8 @@ extern void kronos_pack_a_mr6_avx2_8k(int64_t kc_mul8, const float *A, int64_t l
                                       float *Ap, int64_t scale_alpha, float alpha);
 extern void kronos_pack_a_mr14_avx512_16k(int64_t kc_mul16, const float *A, int64_t lda_bytes,
                                           float *Ap, int64_t scale_alpha, float alpha);
+extern void kronos_pack_a_mr9_avx512_16k(int64_t kc_mul16, const float *A, int64_t lda_bytes,
+                                         float *Ap, int64_t scale_alpha, float alpha);
 
 #define KRONOS_FMA6X16_RANK1(a0,a1,a2,a3,a4,a5, b0,b1) \
     "vmovaps " #b0 "(%rdx), %ymm0\n\t"                 \
@@ -7531,6 +7548,35 @@ extern void kronos_pack_a_mr14_avx512_16k(int64_t kc_mul16, const float *A, int6
     "vmovlps %xmm17, 48+14*56(%rcx)\n\t"  "vmovhps %xmm17, 48+15*56(%rcx)\n\t" \
     "addq $64,  %rsi\n\t"                                                \
     "addq $896, %rcx\n\t"
+
+#define KRONOS_PACK_A_MR9_BODY(SCALE4, SCALE1)                           \
+    "movq %rsi, %rax\n\t"                                                \
+    KRONOS_AVX512_TRANSPOSE_4X16_STORE(0,  36, SCALE4)                   \
+    "leaq (%rax, %r8, 4), %rax\n\t"                                      \
+    KRONOS_AVX512_TRANSPOSE_4X16_STORE(16, 36, SCALE4)                   \
+    "leaq (%rax, %r8, 4), %rax\n\t"                                      \
+    "prefetcht0 128(%rax)\n\t"                                           \
+    "vmovups (%rax), %zmm4\n\t"                                          \
+    SCALE1                                                               \
+    "vmovups %zmm4, -64(%rsp)\n\t"                                       \
+    "movl -64(%rsp), %r11d\n\t" "movl %r11d, 32+0*36(%rcx)\n\t"          \
+    "movl -60(%rsp), %r11d\n\t" "movl %r11d, 32+1*36(%rcx)\n\t"          \
+    "movl -56(%rsp), %r11d\n\t" "movl %r11d, 32+2*36(%rcx)\n\t"          \
+    "movl -52(%rsp), %r11d\n\t" "movl %r11d, 32+3*36(%rcx)\n\t"          \
+    "movl -48(%rsp), %r11d\n\t" "movl %r11d, 32+4*36(%rcx)\n\t"          \
+    "movl -44(%rsp), %r11d\n\t" "movl %r11d, 32+5*36(%rcx)\n\t"          \
+    "movl -40(%rsp), %r11d\n\t" "movl %r11d, 32+6*36(%rcx)\n\t"          \
+    "movl -36(%rsp), %r11d\n\t" "movl %r11d, 32+7*36(%rcx)\n\t"          \
+    "movl -32(%rsp), %r11d\n\t" "movl %r11d, 32+8*36(%rcx)\n\t"          \
+    "movl -28(%rsp), %r11d\n\t" "movl %r11d, 32+9*36(%rcx)\n\t"          \
+    "movl -24(%rsp), %r11d\n\t" "movl %r11d, 32+10*36(%rcx)\n\t"         \
+    "movl -20(%rsp), %r11d\n\t" "movl %r11d, 32+11*36(%rcx)\n\t"         \
+    "movl -16(%rsp), %r11d\n\t" "movl %r11d, 32+12*36(%rcx)\n\t"         \
+    "movl -12(%rsp), %r11d\n\t" "movl %r11d, 32+13*36(%rcx)\n\t"         \
+    "movl  -8(%rsp), %r11d\n\t" "movl %r11d, 32+14*36(%rcx)\n\t"         \
+    "movl  -4(%rsp), %r11d\n\t" "movl %r11d, 32+15*36(%rcx)\n\t"         \
+    "addq $64,  %rsi\n\t"                                                \
+    "addq $576, %rcx\n\t"
 
 __asm__(
     ".pushsection .text, \"ax\", @progbits\n\t"
@@ -8348,6 +8394,46 @@ __asm__(
     "ret\n\t"
     ".cfi_endproc\n\t"
     ".size kronos_pack_a_mr14_avx512_16k, .-kronos_pack_a_mr14_avx512_16k\n\t"
+
+    ".globl  kronos_pack_a_mr9_avx512_16k\n\t"
+    ".hidden kronos_pack_a_mr9_avx512_16k\n\t"
+    ".type   kronos_pack_a_mr9_avx512_16k, @function\n\t"
+    ".p2align 5\n\t"
+    "kronos_pack_a_mr9_avx512_16k:\n\t"
+    ".cfi_startproc\n\t"
+    ".byte 0xf3, 0x0f, 0x1e, 0xfa\n\t"
+    "shrq $4, %rdi\n\t"
+    "jz .Lpa9z_done\n\t"
+    "movq %r8,  %r11\n\t"
+    "movq %rdx, %r8\n\t"
+    "leaq (,%rdx,2), %r9\n\t"
+    "leaq (%rdx,%rdx,2), %r10\n\t"
+    "testq %r11, %r11\n\t"
+    "jnz .Lpa9z_scale_prep\n\t"
+    ".p2align 5\n\t"
+    ".Lpa9z_loop_plain:\n\t"
+    KRONOS_PACK_A_MR9_BODY("", "")
+    "decq %rdi\n\t"
+    "jnz .Lpa9z_loop_plain\n\t"
+    "vzeroupper\n\t"
+    ".Lpa9z_done:\n\t"
+    "ret\n\t"
+    ".Lpa9z_scale_prep:\n\t"
+    "vbroadcastss %xmm0, %zmm31\n\t"
+    ".p2align 5\n\t"
+    ".Lpa9z_loop_scale:\n\t"
+    KRONOS_PACK_A_MR9_BODY(
+        "vmulps %zmm31, %zmm0, %zmm0\n\t"
+        "vmulps %zmm31, %zmm1, %zmm1\n\t"
+        "vmulps %zmm31, %zmm2, %zmm2\n\t"
+        "vmulps %zmm31, %zmm3, %zmm3\n\t",
+        "vmulps %zmm31, %zmm4, %zmm4\n\t")
+    "decq %rdi\n\t"
+    "jnz .Lpa9z_loop_scale\n\t"
+    "vzeroupper\n\t"
+    "ret\n\t"
+    ".cfi_endproc\n\t"
+    ".size kronos_pack_a_mr9_avx512_16k, .-kronos_pack_a_mr9_avx512_16k\n\t"
     ".popsection\n\t"
     ".pushsection .note.GNU-stack,\"\",@progbits\n\t"
     ".popsection\n\t"
@@ -8467,19 +8553,28 @@ static void pack_A_mr14(int transA, int mc, int kc, const float *A, int lda, flo
 
 static void pack_A_mr9(int transA, int mc, int kc, const float *A, int lda, float *Ap, float alpha) {
     if (UNLIKELY(transA)) { pack_A_trans_mr(9, mc, kc, A, lda, Ap, alpha); return; }
-    int scale_alpha = (alpha != 1.0f);
+    int scale_alpha = (alpha != 1.0f) ? 1 : 0;
+    int64_t lda_bytes = (int64_t)lda * (int64_t)sizeof(float);
     for (int i = 0; i < mc; i += 9) {
         int mr = (i + 9 <= mc) ? 9 : (mc - i);
         if (LIKELY(mr == 9)) {
+            int p = 0;
+            if (LIKELY(kc >= 16)) {
+                int kc16 = kc & ~15;
+                kronos_pack_a_mr9_avx512_16k(kc16, A + (size_t)i * (size_t)lda, lda_bytes,
+                                             Ap, scale_alpha, alpha);
+                Ap += (size_t)kc16 * 9u;
+                p   = kc16;
+            }
             const float *rows[9];
             for (int r = 0; r < 9; r++) rows[r] = A + (size_t)(i + r) * (size_t)lda;
             if (!scale_alpha) {
-                for (int p = 0; p < kc; p++) {
+                for (; p < kc; p++) {
                     for (int r = 0; r < 9; r++) Ap[r] = rows[r][p];
                     Ap += 9;
                 }
             } else {
-                for (int p = 0; p < kc; p++) {
+                for (; p < kc; p++) {
                     for (int r = 0; r < 9; r++) Ap[r] = rows[r][p] * alpha;
                     Ap += 9;
                 }
@@ -9036,6 +9131,73 @@ static void kronos_sgemm_ex(int M, int N, int K, float alpha,
  *  9. 5-STAGE EXHAUSTIVE KERNEL VERIFICATION, ADVERSARIAL STRESS & TELEMETRY
  * ============================================================================ */
 
+static inline float f_abs(float x) { return x < 0.0f ? -x : x; }
+
+static int verify_gemm_tn(int transA, int transB, int M, int N, int K,
+                          int pad_a, int pad_b, int pad_c,
+                          float alpha, float beta,
+                          const GemmKernelDesc *kd, GemmWorkspace *ws) {
+    int a_rows = transA ? K : M, a_cols = transA ? M : K;
+    int b_rows = transB ? N : K, b_cols = transB ? K : N;
+    int lda = a_cols + pad_a, ldb = b_cols + pad_b, ldc = N + pad_c;
+    GemmTuning tun = kronos_autotune_gemm(kd);
+    size_t a_elems = (K > 0) ? (size_t)a_rows * (size_t)lda : 1u;
+    size_t b_elems = (K > 0) ? (size_t)b_rows * (size_t)ldb : 1u;
+    float *A  = (float *)xaligned_alloc(64, a_elems * sizeof(float));
+    float *B  = (float *)xaligned_alloc(64, b_elems * sizeof(float));
+    float *C  = (float *)xaligned_alloc(64, (size_t)M * (size_t)ldc * sizeof(float));
+    float *C0 = (float *)xaligned_alloc(64, (size_t)M * (size_t)ldc * sizeof(float));
+
+    uint64_t rng = 0x123456789ABCDEF0ULL ^ ((uint64_t)M << 32) ^ ((uint64_t)N << 16) ^
+                   (uint64_t)K ^ ((uint64_t)transA << 1) ^ (uint64_t)transB;
+    for (size_t i = 0; i < a_elems; i++)
+        A[i] = ((float)(int)(xorshift64(&rng) & 255u) - 128.0f) * 0.01f;
+    for (size_t i = 0; i < b_elems; i++)
+        B[i] = ((float)(int)(xorshift64(&rng) & 255u) - 128.0f) * 0.01f;
+
+    float qnan = make_qnan_f32();
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < ldc; j++) {
+            float v = ((float)(int)(xorshift64(&rng) & 255u) - 128.0f) * 0.01f;
+            C0[(size_t)i * (size_t)ldc + (size_t)j] = v;
+            C[(size_t)i * (size_t)ldc + (size_t)j]  = (j < N && beta == 0.0f) ? qnan : v;
+        }
+    }
+
+    kronos_sgemm_tn(transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, tun, kd, ws);
+
+    int ok = 1;
+    float max_rel = 0.0f;
+    for (int i = 0; i < M && ok; i++) {
+        for (int j = N; j < ldc; j++) {
+            if (C[(size_t)i * (size_t)ldc + (size_t)j] != C0[(size_t)i * (size_t)ldc + (size_t)j]) {
+                ok = 0; break;
+            }
+        }
+        for (int j = 0; j < N && ok; j++) {
+            float got = C[(size_t)i * (size_t)ldc + (size_t)j];
+            if (!is_finite_f32(got)) { ok = 0; break; }
+            double ref = (beta == 0.0f) ? 0.0 : (double)beta * (double)C0[(size_t)i * (size_t)ldc + (size_t)j];
+            double dot = 0.0;
+            for (int k = 0; k < K; k++) {
+                float av = transA ? A[(size_t)k * (size_t)lda + (size_t)i]
+                                  : A[(size_t)i * (size_t)lda + (size_t)k];
+                float bv = transB ? B[(size_t)j * (size_t)ldb + (size_t)k]
+                                  : B[(size_t)k * (size_t)ldb + (size_t)j];
+                dot += (double)av * (double)bv;
+            }
+            ref += (double)alpha * dot;
+            float diff  = f_abs(got - (float)ref);
+            float scale = f_abs((float)ref) + 1.0f;
+            float rel   = diff / scale;
+            if (!(rel <= max_rel)) max_rel = rel;
+        }
+    }
+    free(A); free(B); free(C); free(C0);
+    return ok && is_finite_f32(max_rel) && (max_rel < 1e-4f);
+}
+
+#ifndef KRONOS_NO_MAIN
 static void print_banner(void) {
     KPRINTF("\n%s%s", C_CYAN, C_BOLD);
     KPRINTF("╔══════════════════════════════════════════════════════════════════════════════╗\n");
@@ -9764,7 +9926,7 @@ typedef struct {
 
 static void jit_parallel_fiber(void *arg) {
     JitFiberArg *a = (JitFiberArg *)arg;
-    a->result       = a->fn(a->seed, a->iters, 0);
+    a->result       = kbpf_call_jit(a->fn, a->seed, a->iters, 0);
     a->preempt_hits = kronos_current_fiber_preempt_hits();
     latch_done(a->latch);
 }
@@ -9820,8 +9982,8 @@ static void run_stage3_jit(void) {
     KBpfCompiled fuel_jit;
     int fuel_ok = 0;
     if (kbpf_jit_compile(inf_prog, 5, KBPF_CAP_BOUNDED_LOOP, &fuel_jit, err, sizeof(err)) == 0) {
-        uint64_t r_safe_j = fuel_jit.fn(0, 0, 0);
-        uint64_t r_inf_j  = fuel_jit.fn(1, 0, 0);
+        uint64_t r_safe_j = kbpf_call_jit(fuel_jit.fn, 0, 0, 0);
+        uint64_t r_inf_j  = kbpf_call_jit(fuel_jit.fn, 1, 0, 0);
         uint64_t r_inf_i  = kbpf_exec_interp_unchecked(inf_prog, 5, KBPF_CAP_BOUNDED_LOOP, 1, 0, 0);
         fuel_ok = (r_safe_j == 0ULL) && (r_inf_j == KBPF_FUEL_EXHAUSTED) && (r_inf_i == KBPF_FUEL_EXHAUSTED);
         kbpf_jit_free(&fuel_jit);
@@ -9859,19 +10021,19 @@ static void run_stage3_jit(void) {
 
     const uint64_t seed  = 0xDEADBEEFCAFEBABEULL;
     const uint64_t iters = 2000000ULL;
-    (void)arx_jit.fn(seed, 10000ULL, 0);
+    (void)kbpf_call_jit(arx_jit.fn, seed, 10000ULL, 0);
 
     uint64_t ti0 = monotonic_ns();
     uint64_t res_interp = kbpf_exec_interp_unchecked(arx_prog, n_arx, KBPF_CAP_NONE, seed, iters, 0);
     uint64_t ti1 = monotonic_ns();
 
     uint64_t tj0 = monotonic_ns();
-    uint64_t res_jit = arx_jit.fn(seed, iters, 0);
+    uint64_t res_jit = kbpf_call_jit(arx_jit.fn, seed, iters, 0);
     uint64_t tj1 = monotonic_ns();
 
     int njf = g_kern.num_cores * 2;
     uint64_t p_iters = iters * 4ULL;
-    uint64_t ref_p   = arx_jit.fn(seed, p_iters, 0);
+    uint64_t ref_p   = kbpf_call_jit(arx_jit.fn, seed, p_iters, 0);
     JitFiberArg *jf_args = (JitFiberArg *)calloc((size_t)njf, sizeof(JitFiberArg));
     if (!jf_args) { perror("calloc JitFiberArg"); exit(1); }
     KronosLatch l_jit;
@@ -9942,7 +10104,7 @@ static void run_stage3_jit(void) {
                                          (uintptr_t)va, (uintptr_t)vb1, n_vec);
     uint64_t di1 = monotonic_ns();
     uint64_t dj0 = monotonic_ns();
-    uint64_t res_j = rw_jit.fn((uintptr_t)va, (uintptr_t)vb2, n_vec);
+    uint64_t res_j = kbpf_call_jit(rw_jit.fn, (uintptr_t)va, (uintptr_t)vb2, n_vec);
     uint64_t dj1 = monotonic_ns();
 
     const KBpfInsn bnd32_prog[] = {
@@ -9964,14 +10126,14 @@ static void run_stage3_jit(void) {
     if (bnd_ok) {
         uint32_t arr32[10] = { 10, 20, 30, 40, 50, 60, 70, 80, 0xCAFEBABEu, 0xDEADBEEFu };
         const uint64_t byte_len = 8u * sizeof(uint32_t);
-        uint64_t v_in     = bnd32_jit.fn((uintptr_t)arr32, 3, byte_len);
-        uint64_t v_oob    = bnd32_jit.fn((uintptr_t)arr32, 8, byte_len);
-        uint64_t v_zero   = bnd32_jit.fn(0ULL, 0, 0ULL);          /* NULL base + R3=0 -> safe 0 */
-        uint64_t v_un7_ok = bnd32_jit.fn((uintptr_t)arr32, 0, 7); /* 7 bytes = 1 u32 -> idx 0 OK */
-        uint64_t v_un7_no = bnd32_jit.fn((uintptr_t)arr32, 1, 7); /* 7 bytes = 1 u32 -> idx 1 OOB */
-        uint64_t v64_un7  = bnd64_jit.fn((uintptr_t)arr32, 0, 7); /* 7 bytes = 0 u64 -> idx 0 OOB */
-        uint64_t v64_un11 = bnd64_jit.fn((uintptr_t)arr32, 0, 11);/* 11 bytes = 1 u64 -> idx 0 OK */
-        uint64_t v64_oob  = bnd64_jit.fn((uintptr_t)arr32, 1, 11);/* 11 bytes = 1 u64 -> idx 1 OOB */
+        uint64_t v_in     = kbpf_call_jit(bnd32_jit.fn, (uintptr_t)arr32, 3, byte_len);
+        uint64_t v_oob    = kbpf_call_jit(bnd32_jit.fn, (uintptr_t)arr32, 8, byte_len);
+        uint64_t v_zero   = kbpf_call_jit(bnd32_jit.fn, 0ULL, 0, 0ULL);          /* NULL base + R3=0 -> safe 0 */
+        uint64_t v_un7_ok = kbpf_call_jit(bnd32_jit.fn, (uintptr_t)arr32, 0, 7); /* 7 bytes = 1 u32 -> idx 0 OK */
+        uint64_t v_un7_no = kbpf_call_jit(bnd32_jit.fn, (uintptr_t)arr32, 1, 7); /* 7 bytes = 1 u32 -> idx 1 OOB */
+        uint64_t v64_un7  = kbpf_call_jit(bnd64_jit.fn, (uintptr_t)arr32, 0, 7); /* 7 bytes = 0 u64 -> idx 0 OOB */
+        uint64_t v64_un11 = kbpf_call_jit(bnd64_jit.fn, (uintptr_t)arr32, 0, 11);/* 11 bytes = 1 u64 -> idx 0 OK */
+        uint64_t v64_oob  = kbpf_call_jit(bnd64_jit.fn, (uintptr_t)arr32, 1, 11);/* 11 bytes = 1 u64 -> idx 1 OOB */
         uint64_t v64_exp0 = ((uint64_t)arr32[1] << 32) | (uint64_t)arr32[0];
         bnd_ok = (v_in == (40u ^ 0x5A5A5A5Au)) && (arr32[3] == (40u ^ 0x5A5A5A5Au)) &&
                  (arr32[8] == 0xCAFEBABEu) && (arr32[9] == 0xDEADBEEFu) &&
@@ -10079,7 +10241,7 @@ static void run_stage3_jit(void) {
         for (int i = 0; i < 8; i++) {
             for (int j = 0; j < 8; j++) {
                 uint64_t ri = kbpf_exec_interp_unchecked(opt_prog, n_opt, KBPF_CAP_NONE, cases[i], cases[j], 0);
-                uint64_t rj = opt_jit.fn(cases[i], cases[j], 0);
+                uint64_t rj = kbpf_call_jit(opt_jit.fn, cases[i], cases[j], 0);
                 if (ri != rj) opt_ok = 0;
             }
         }
@@ -10103,7 +10265,7 @@ static void run_stage3_jit(void) {
             const uint64_t btests[4] = { 0ULL, 1ULL, 0x8000000000000000ULL, 0x000DCAFEBABE1230ULL };
             for (int t = 0; t < 4; t++) {
                 uint64_t ri = kbpf_exec_interp_unchecked(bit_prog, 8, KBPF_CAP_NONE, btests[t], 0, 0);
-                uint64_t rj = bjit.fn(btests[t], 0, 0);
+                uint64_t rj = kbpf_call_jit(bjit.fn, btests[t], 0, 0);
                 if (ri != rj) ext_ok = 0;
             }
             kbpf_jit_free(&bjit);
@@ -10136,7 +10298,7 @@ static void run_stage3_jit(void) {
     if (rel32_ok) {
         n_long_br = long_jit.long_branches;
         uint64_t ri = kbpf_exec_interp_unchecked(long_prog, lp, KBPF_CAP_BOUNDED_LOOP, 0xCAFEBABE12345678ULL, 100ULL, 0);
-        uint64_t rj = long_jit.fn(0xCAFEBABE12345678ULL, 100ULL, 0);
+        uint64_t rj = kbpf_call_jit(long_jit.fn, 0xCAFEBABE12345678ULL, 100ULL, 0);
         rel32_ok = (ri == rj) && (n_long_br >= 2);
         kbpf_jit_free(&long_jit);
     }
@@ -10149,8 +10311,6 @@ static void run_stage3_jit(void) {
 }
 
 /* --- Stage 4: Silicon-Calibrated Double-Buf BLIS GEMM + TransA/B + VNNI + Hybrid PMU --- */
-static inline float f_abs(float x) { return x < 0.0f ? -x : x; }
-
 typedef struct {
     int          tid, P, M, N, K;
     float       *A, *B, *C;
@@ -10180,70 +10340,6 @@ static void gemm_numa_init_fiber(void *arg) {
     for (size_t i = c0; i < c1; i++) a->C[i] = qnan;
 
     latch_done(a->latch);
-}
-
-static int verify_gemm_tn(int transA, int transB, int M, int N, int K,
-                          int pad_a, int pad_b, int pad_c,
-                          float alpha, float beta,
-                          const GemmKernelDesc *kd, GemmWorkspace *ws) {
-    int a_rows = transA ? K : M, a_cols = transA ? M : K;
-    int b_rows = transB ? N : K, b_cols = transB ? K : N;
-    int lda = a_cols + pad_a, ldb = b_cols + pad_b, ldc = N + pad_c;
-    GemmTuning tun = kronos_autotune_gemm(kd);
-    size_t a_elems = (K > 0) ? (size_t)a_rows * (size_t)lda : 1u;
-    size_t b_elems = (K > 0) ? (size_t)b_rows * (size_t)ldb : 1u;
-    float *A  = (float *)xaligned_alloc(64, a_elems * sizeof(float));
-    float *B  = (float *)xaligned_alloc(64, b_elems * sizeof(float));
-    float *C  = (float *)xaligned_alloc(64, (size_t)M * (size_t)ldc * sizeof(float));
-    float *C0 = (float *)xaligned_alloc(64, (size_t)M * (size_t)ldc * sizeof(float));
-
-    uint64_t rng = 0x123456789ABCDEF0ULL ^ ((uint64_t)M << 32) ^ ((uint64_t)N << 16) ^
-                   (uint64_t)K ^ ((uint64_t)transA << 1) ^ (uint64_t)transB;
-    for (size_t i = 0; i < a_elems; i++)
-        A[i] = ((float)(int)(xorshift64(&rng) & 255u) - 128.0f) * 0.01f;
-    for (size_t i = 0; i < b_elems; i++)
-        B[i] = ((float)(int)(xorshift64(&rng) & 255u) - 128.0f) * 0.01f;
-
-    float qnan = make_qnan_f32();
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < ldc; j++) {
-            float v = ((float)(int)(xorshift64(&rng) & 255u) - 128.0f) * 0.01f;
-            C0[(size_t)i * (size_t)ldc + (size_t)j] = v;
-            C[(size_t)i * (size_t)ldc + (size_t)j]  = (j < N && beta == 0.0f) ? qnan : v;
-        }
-    }
-
-    kronos_sgemm_tn(transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, tun, kd, ws);
-
-    int ok = 1;
-    float max_rel = 0.0f;
-    for (int i = 0; i < M && ok; i++) {
-        for (int j = N; j < ldc; j++) {
-            if (C[(size_t)i * (size_t)ldc + (size_t)j] != C0[(size_t)i * (size_t)ldc + (size_t)j]) {
-                ok = 0; break;
-            }
-        }
-        for (int j = 0; j < N && ok; j++) {
-            float got = C[(size_t)i * (size_t)ldc + (size_t)j];
-            if (!is_finite_f32(got)) { ok = 0; break; }
-            double ref = (beta == 0.0f) ? 0.0 : (double)beta * (double)C0[(size_t)i * (size_t)ldc + (size_t)j];
-            double dot = 0.0;
-            for (int k = 0; k < K; k++) {
-                float av = transA ? A[(size_t)k * (size_t)lda + (size_t)i]
-                                  : A[(size_t)i * (size_t)lda + (size_t)k];
-                float bv = transB ? B[(size_t)j * (size_t)ldb + (size_t)k]
-                                  : B[(size_t)k * (size_t)ldb + (size_t)j];
-                dot += (double)av * (double)bv;
-            }
-            ref += (double)alpha * dot;
-            float diff  = f_abs(got - (float)ref);
-            float scale = f_abs((float)ref) + 1.0f;
-            float rel   = diff / scale;
-            if (!(rel <= max_rel)) max_rel = rel;
-        }
-    }
-    free(A); free(B); free(C); free(C0);
-    return ok && is_finite_f32(max_rel) && (max_rel < 1e-4f);
 }
 
 static void run_stage4_gemm(int dim, const char *req_kernel) {
@@ -10635,7 +10731,6 @@ static int parse_u64_arg(const char *flag, const char *s, uint64_t *out) {
     return 0;
 }
 
-#ifndef KRONOS_NO_MAIN
 int main(int argc, char **argv) {
     g_use_color = isatty(STDOUT_FILENO) && (getenv("NO_COLOR") == NULL);
 
@@ -10718,10 +10813,10 @@ int main(int argc, char **argv) {
             C_GRN, g_cpu.tsc_ghz, C_RST, g_cpu.tsc_src, g_cpu.ns_per_cycle, g_pause_cycles,
             g_cpu.has_rdtscp ? "YES" : "NO", g_cpu.tsc_clocksource_ok ? "VERIFIED" : "MONOTONIC");
     KPRINTF("  Caches (Min): L1d=%" PRIu64 "KiB(%uw/%ut) | L1i=%" PRIu64 "KiB | L2=%" PRIu64 "KiB(act-eff %" PRIu64 "KiB) | L3=%" PRIu64 "KiB | Line=%uB\n",
-            g_cpu.l1d_bytes / 1024ULL, g_cpu.l1d_ways, g_cpu.l1d_shared_by,
-            g_cpu.l1i_bytes / 1024ULL,
-            g_cpu.l2_bytes / 1024ULL, g_cpu.l2_eff_per_core / 1024ULL,
-            g_cpu.l3_bytes / 1024ULL, g_cpu.cache_line_bytes);
+            (uint64_t)(g_cpu.l1d_bytes / 1024ULL), g_cpu.l1d_ways, g_cpu.l1d_shared_by,
+            (uint64_t)(g_cpu.l1i_bytes / 1024ULL),
+            (uint64_t)(g_cpu.l2_bytes / 1024ULL), (uint64_t)(g_cpu.l2_eff_per_core / 1024ULL),
+            (uint64_t)(g_cpu.l3_bytes / 1024ULL), g_cpu.cache_line_bytes);
     KPRINTF("  ISA (Common): AVX2=%d FMA=%d BMI1/2=%d/%d LZCNT=%d POPCNT=%d PREFETCHW=%d AVX-512F/DQ/BW/VL/VNNI=%d/%d/%d/%d/%d\n",
             g_cpu.has_avx2, g_cpu.has_fma, g_cpu.has_bmi1, g_cpu.has_bmi2, g_cpu.has_lzcnt,
             g_cpu.has_popcnt, g_cpu.has_prefetchw,
