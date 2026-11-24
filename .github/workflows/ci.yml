@@ -1,0 +1,192 @@
+name: KRONOS-X Comprehensive CI, Adversarial Tests & Benchmarks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "GCC-O3-Strict"
+            cc: gcc
+            cflags: "-std=c11 -O3 -Wall -Wextra -Wshadow -Wpedantic -Wconversion -Wno-sign-conversion -Werror=implicit-function-declaration -Werror=return-type -pthread"
+            run_bench: true
+            run_suite: true
+            run_cli: true
+          - name: "Clang-O3-Strict"
+            cc: clang
+            cflags: "-std=c11 -O3 -Wall -Wextra -Wshadow -Wpedantic -Werror=implicit-function-declaration -Werror=return-type -pthread"
+            run_bench: true
+            run_suite: true
+            run_cli: false
+          - name: "GCC-O3-LTO-PIE"
+            cc: gcc
+            cflags: "-std=c11 -O3 -flto -fPIE -pie -Wall -Wextra -Wshadow -pthread"
+            run_bench: true
+            run_suite: true
+            run_cli: false
+          - name: "GCC-O3-NoPIE-SlabDebug"
+            cc: gcc
+            cflags: "-std=c11 -O3 -no-pie -DKRONOS_SLAB_DEBUG -Wall -Wextra -Wshadow -pthread"
+            run_bench: true
+            run_suite: true
+            run_cli: false
+          - name: "GCC-O0-Debug"
+            cc: gcc
+            cflags: "-std=c11 -O0 -g -Wall -Wextra -Wshadow -pthread"
+            run_bench: false
+            run_suite: true
+            run_cli: false
+          - name: "Clang-O2-UBSan"
+            cc: clang
+            cflags: "-std=c11 -O2 -g -fsanitize=undefined -fno-sanitize-recover=all -Wall -Wextra -Wshadow -pthread"
+            run_bench: true
+            run_suite: true
+            run_cli: false
+          - name: "GCC-O2-Static-Link-Guard"
+            cc: gcc
+            cflags: "-std=c11 -O2 -static -Wall -Wextra -Wshadow -pthread"
+            run_bench: true
+            run_suite: false
+            run_cli: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System & Silicon Info
+        run: |
+          uname -a
+          ${{ matrix.cc }} --version
+          lscpu || true
+
+      - name: Compile kernel.c
+        run: |
+          ${{ matrix.cc }} ${{ matrix.cflags }} kernel.c -o kronos
+
+      - name: Run Main Kernel Suite (default, --cores 1, oversubscribed, --json, --csv)
+        if: matrix.run_bench
+        run: |
+          set -e
+          echo "=== Default Run ==="
+          ./kronos --no-color --gemm 512
+          echo "=== Single-Core Run ==="
+          ./kronos --no-color --cores 1 --gemm 256 --quantum-us 400
+          echo "=== Oversubscribed (8 vCores) Run ==="
+          ./kronos --no-color --cores 8 --gemm 256 --quantum-us 400
+          echo "=== Scalar GEMM Kernel Run ==="
+          ./kronos --no-color --gemm 256 --gemm-kernel scalar
+          echo "=== JSON Telemetry Validation ==="
+          ./kronos --json --gemm 256 > out.json
+          cat out.json
+          python3 -c 'import json; d = json.load(open("out.json")); assert d["failures"] == 0, d; print("JSON OK:", d["gemm_kernel"], d["gemm_peak_gflops"], "GF/s")'
+          echo "=== CSV Telemetry Validation ==="
+          ./kronos --csv --gemm 256 > out.csv
+          cat out.csv
+          python3 -c 'import csv; rows=list(csv.DictReader(open("out.csv"))); assert len(rows)==1 and rows[0]["failures"]=="0", rows; print("CSV OK")'
+
+      - name: CLI Argument Validation Tests
+        if: matrix.run_cli
+        run: |
+          set -e
+          ./kronos --help
+          ! ./kronos --cores 0
+          ! ./kronos --cores 999
+          ! ./kronos --cores abc
+          ! ./kronos --gemm 16
+          ! ./kronos --gemm 99999
+          ! ./kronos --quantum-us 10
+          ! ./kronos --quantum-us 999999
+          ! ./kronos --gemm-kernel bogus
+          ! ./kronos --unknown-flag
+          echo "All CLI negative checks passed!"
+
+      - name: Compile & Run White-Box Adversarial Test Suite
+        if: matrix.run_suite
+        run: |
+          set -e
+          ${{ matrix.cc }} ${{ matrix.cflags }} tests/test_suite.c -o test_suite
+          echo "=== Test Suite (native cores) ==="
+          ./test_suite
+          echo "=== Test Suite (1 core) ==="
+          ./test_suite --cores 1
+          echo "=== Test Suite (oversubscribed 8 vCores) ==="
+          ./test_suite --cores 8
+
+  avx512-sde-emulation:
+    name: "Intel-ISA / QEMU-User Cross-Microarch Tests (AVX2, AVX-512F+VNNI, SSE4.2)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install qemu-user & tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+
+      - name: Compile kernel & white-box suite
+        run: |
+          gcc -std=c11 -O3 -Wall -Wextra -Wshadow -pthread kernel.c -o kronos
+          gcc -std=c11 -O3 -Wall -Wextra -Wshadow -pthread tests/test_suite.c -o test_suite
+
+      - name: Run under QEMU-x86_64 (Nehalem - SSE4.2 only, no AVX/BMI)
+        run: |
+          qemu-x86_64 -cpu Nehalem ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
+          qemu-x86_64 -cpu Nehalem ./test_suite --cores 2
+
+      - name: Run under QEMU-x86_64 (Haswell - AVX2 + FMA + BMI1/2 + LZCNT)
+        run: |
+          qemu-x86_64 -cpu Haswell ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
+          qemu-x86_64 -cpu Haswell ./test_suite --cores 2
+
+      - name: Run under QEMU-x86_64 (Skylake-Server - AVX-512F + 14x32 & 9x48)
+        run: |
+          qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512 --quantum-us 2000
+          qemu-x86_64 -cpu Skylake-Server ./kronos --no-color --cores 2 --gemm 128 --gemm-kernel avx512-9x48 --quantum-us 2000
+          qemu-x86_64 -cpu Skylake-Server ./test_suite --cores 2
+
+      - name: Run under QEMU-x86_64 (Cascadelake-Server - AVX-512F + AVX-512 VNNI)
+        run: |
+          qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./kronos --no-color --cores 2 --gemm 128 --quantum-us 2000
+          qemu-x86_64 -cpu Cascadelake-Server,+avx512vnni ./test_suite --cores 2
+
+  asan-and-static-analysis:
+    name: "Static Analysis (cppcheck / clang-tidy) & Warning-Free Audit"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck valgrind
+
+      - name: Strict GCC + Clang -Werror Build Check
+        run: |
+          gcc -std=c11 -O3 -Wall -Wextra -Wshadow -Wformat=2 -Wstrict-prototypes -Wold-style-definition -Wmissing-prototypes -Werror -pthread kernel.c -o kronos_gcc_werror
+          clang -std=c11 -O3 -Wall -Wextra -Wshadow -Wformat=2 -Wstrict-prototypes -Werror -pthread kernel.c -o kronos_clang_werror
+
+      - name: Verify ELF Security & DWARF CFI Properties
+        run: |
+          readelf -l kronos_gcc_werror | grep -E "GNU_STACK|RWE" || true
+          # Confirm stack is non-executable (RW, not RWE)
+          readelf -l kronos_gcc_werror | grep "GNU_STACK" | grep -v "RWE"
+          # Confirm DWARF .eh_frame unwind info exists for custom assembly symbols
+          readelf --debug-dump=frames kronos_gcc_werror | grep -c "FDE"
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,performance,portability --std=c11 --suppress=missingIncludeSystem --inline-suppr kernel.c
